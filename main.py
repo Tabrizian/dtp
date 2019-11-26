@@ -1,15 +1,12 @@
 import torch
 import torch.optim as optim
-import torchvision
 import torch.distributed as dist
 from torch.multiprocessing import Process
 from torch.functional import F
+
 import os
 import sys
-
-from random import Random
 from math import ceil
-
 
 from dtp.datasets.cifar_10 import CIFAR10
 import dtp.models.resnet as ResNet
