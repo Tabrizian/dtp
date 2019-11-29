@@ -13,10 +13,10 @@ import dtp.models.resnet as ResNet
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-EPOCHS = 10
-MASTER_IP = '127.0.0.1'
-MASTER_PORT = '8080'
-BATCH_SIZE = 30
+EPOCHS = 5
+MASTER_IP = '10.11.13.41'
+MASTER_PORT = '8888'
+BATCH_SIZE = 10
 
 
 def partition_dataset():
@@ -34,7 +34,7 @@ def run(rank, size):
     torch.manual_seed(1234)
     train_set, bsz = partition_dataset()
     print(len(train_set))
-    model = ResNet.ResNet50()
+    model = ResNet.ResNet18()
     optimizer = optim.SGD(
         model.parameters(),
         lr=0.01, momentum=0.5
@@ -44,23 +44,30 @@ def run(rank, size):
     num_batches = ceil(len(train_set.dataset) / float(bsz))
     train_set_size = len(train_set)
 
+    losses = []
+    mini_batch_loss = []
     for epoch in range(10):
         epoch_loss = 0.0
         index = 0
+        current_batch_loss = []
         for data, target in train_set:
-            if index == 20:
-                break
             index += 1
             optimizer.zero_grad()
             output = model(data)
             loss = F.nll_loss(output, target)
             epoch_loss += loss.item()
+            current_batch_loss.append(epoch_loss / index)
             loss.backward()
             average_gradients(model)
             optimizer.step()
-            print('Processed ', index, ' / ', train_set_size)
-            print('Rank ', dist.get_rank(), ', epoch ',
-                  epoch, ': ', epoch_loss / num_batches)
+            print('Processed', str(index)+ '/'+ str(train_set_size))
+            print('Rank', dist.get_rank(), ', epoch',
+                  str(epoch) + ':', epoch_loss / num_batches)
+        mini_batch_loss.append(epoch_loss)
+        losses.append(epoch_loss)
+    print(losses)
+    if dist.get_rank() == 0:
+        torch.save(model.state_dict(), './model.pt')
 
 
 def average_gradients(model):
@@ -75,7 +82,7 @@ def init_process(rank, size, fn, backend='gloo'):
     os.environ['MASTER_ADDR'] = MASTER_IP
     os.environ['MASTER_PORT'] = MASTER_PORT
     os.environ['WORLD_SIZE'] = str(total_size)
-    dist.init_process_group(backend, rank=rank, world_size=total_size)
+    dist.init_process_group(backend, init_method='file:///mnt/sharedfolder/share', rank=rank, world_size=total_size)
     fn(rank, size)
 
 
