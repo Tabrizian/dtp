@@ -18,8 +18,10 @@ EPOCHS = 5
 MASTER_IP = '10.11.13.41'
 MASTER_PORT = '8888'
 BATCH_SIZE = 10
+LOCAL_ITERATIONS = 5
 
 criterion = nn.CrossEntropyLoss()
+percentage = 0.4
 
 
 def partition_dataset():
@@ -43,6 +45,9 @@ def run(rank, size):
         model.parameters(),
         lr=0.01, momentum=0.5
     )
+    clients = torch.arange(1, dist.get_world_size())
+    participating_counts = percentage * (dist.get_world_size() - 1)
+
     print('Rank', dist.get_rank())
 
     num_batches = ceil(len(train_set.dataset) / float(bsz))
@@ -50,13 +55,34 @@ def run(rank, size):
 
     losses = []
     mini_batch_loss = []
-    for epoch in range(10):
+    for epoch in range(EPOCHS):
         epoch_loss = 0.0
         index = 0
         current_batch_loss = []
+        turn = torch.zeros(1)
+        mini_batches_to_go = 0
         for data, target in train_set:
+            if dist.get_rank() == 0 and mini_batches_to_go == 0:
+                permutation = torch.randperm(dist.get_world_size() - 1)
+                clients = clients[permutation]
+                participating_clients = clients[0:participating_counts]
+                not_participating = clients[participating_counts:]
+                mini_batches_to_go = LOCAL_ITERATIONS
+                for client in participating_clients:
+                    dist.send(torch.tensor(1), dst=client)
+                for client in not_participating:
+                    dist.send(torch.tensor(0), dst=client)
+            else:
+                if mini_batches_to_go == 0:
+                    while True:
+                        dist.recv(turn, src=0)
+                        if turn == 1:
+                            mini_batches_to_go = LOCAL_ITERATIONS
+                            break
+
+            mini_batches_to_go -= 1
             index += 1
-            if index % 20 == 0:
+            if index % 250 == 0:
                 accuracy(model, test_set)
             optimizer.zero_grad()
             output = model(data)
@@ -64,7 +90,8 @@ def run(rank, size):
             epoch_loss += loss.item()
             current_batch_loss.append(epoch_loss / index)
             loss.backward()
-            average_gradients(model)
+            if mini_batches_to_go == 0:
+                average_gradients(model)
             optimizer.step()
             print('Processed', str(index) + '/' + str(train_set_size))
             print('Rank', dist.get_rank(), ', epoch',
@@ -73,6 +100,7 @@ def run(rank, size):
         losses.append(epoch_loss)
     print(losses)
     if dist.get_rank() == 0:
+        accuracy(model, test_set)
         torch.save(model.state_dict(), './model.pt')
 
 
@@ -106,8 +134,7 @@ def accuracy(model, test_set):
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
-            print('Accuracy:', 100.0 * correct / total)
-            print('Progress:', batch_idx, len(test_set))
+    print('====================Accuracy:', 100.0 * correct / total, '=========================================')
 
 
 if __name__ == '__main__':
