@@ -3,6 +3,7 @@ import torch.optim as optim
 import torch.distributed as dist
 from torch.multiprocessing import Process
 from torch.functional import F
+from torch import nn
 
 import os
 import sys
@@ -18,21 +19,24 @@ MASTER_IP = '10.11.13.41'
 MASTER_PORT = '8888'
 BATCH_SIZE = 10
 
+criterion = nn.CrossEntropyLoss()
+
 
 def partition_dataset():
     size = dist.get_world_size()
     partition_sizes = [1.0 / size for _ in range(size)]
     partition = CIFAR10(partition_sizes)
+    test_set = partition.test
     partition = partition.use(dist.get_rank())
     train_set = torch.utils.data.DataLoader(partition,
                                          batch_size=BATCH_SIZE,
                                          shuffle=True)
-    return train_set, BATCH_SIZE
+    return train_set, BATCH_SIZE, test_set
 
 
 def run(rank, size):
     torch.manual_seed(1234)
-    train_set, bsz = partition_dataset()
+    train_set, bsz, test_set = partition_dataset()
     print(len(train_set))
     model = ResNet.ResNet18()
     optimizer = optim.SGD(
@@ -52,15 +56,17 @@ def run(rank, size):
         current_batch_loss = []
         for data, target in train_set:
             index += 1
+            if index % 20 == 0:
+                accuracy(model, test_set)
             optimizer.zero_grad()
             output = model(data)
-            loss = F.nll_loss(output, target)
+            loss = F.cross_entropy(output, target)
             epoch_loss += loss.item()
             current_batch_loss.append(epoch_loss / index)
             loss.backward()
             average_gradients(model)
             optimizer.step()
-            print('Processed', str(index)+ '/'+ str(train_set_size))
+            print('Processed', str(index) + '/' + str(train_set_size))
             print('Rank', dist.get_rank(), ', epoch',
                   str(epoch) + ':', epoch_loss / num_batches)
         mini_batch_loss.append(epoch_loss)
@@ -84,6 +90,24 @@ def init_process(rank, size, fn, backend='gloo'):
     os.environ['WORLD_SIZE'] = str(total_size)
     dist.init_process_group(backend, init_method='file:///mnt/sharedfolder/share', rank=rank, world_size=total_size)
     fn(rank, size)
+
+
+def accuracy(model, test_set):
+    test_loss = 0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(test_set):
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+
+            test_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+            print('Accuracy:', 100.0 * correct / total)
+            print('Progress:', batch_idx, len(test_set))
 
 
 if __name__ == '__main__':
