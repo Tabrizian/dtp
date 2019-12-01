@@ -8,6 +8,7 @@ from torch import nn
 import os
 import sys
 from math import ceil
+import time
 
 from dtp.datasets.cifar_10 import CIFAR10
 import dtp.models.resnet as ResNet
@@ -21,7 +22,7 @@ BATCH_SIZE = 10
 LOCAL_ITERATIONS = 5
 
 criterion = nn.CrossEntropyLoss()
-percentage = 0.4
+participating_counts = 2
 
 
 def partition_dataset():
@@ -46,7 +47,6 @@ def run(rank, size):
         lr=0.01, momentum=0.5
     )
     clients = torch.arange(1, dist.get_world_size())
-    participating_counts = percentage * (dist.get_world_size() - 1)
 
     print('Rank', dist.get_rank())
 
@@ -59,30 +59,56 @@ def run(rank, size):
         epoch_loss = 0.0
         index = 0
         current_batch_loss = []
-        turn = torch.zeros(1)
+        turn = torch.tensor(0)
+        participating_clients = torch.zeros(participating_counts + 1, dtype=torch.long)
         mini_batches_to_go = 0
+        number_of_elections = 0
+        group = None
         for data, target in train_set:
             if dist.get_rank() == 0 and mini_batches_to_go == 0:
+                print('============election phase %s started===========' % number_of_elections)
+                number_of_elections += 1
                 permutation = torch.randperm(dist.get_world_size() - 1)
                 clients = clients[permutation]
                 participating_clients = clients[0:participating_counts]
                 not_participating = clients[participating_counts:]
+                participating_clients_final = participating_clients.tolist()
+                participating_clients_final.append(0)
+                print('Participating %s' % participating_clients_final)
                 mini_batches_to_go = LOCAL_ITERATIONS
-                for client in participating_clients:
-                    dist.send(torch.tensor(1), dst=client)
-                for client in not_participating:
-                    dist.send(torch.tensor(0), dst=client)
+                for index_2, client in enumerate(clients.tolist()):
+                    if index_2 < participating_counts:
+                        dist.send(torch.tensor(1), dst=client)
+                        print('Turn sent for client %s' % client)
+                    else:
+                        dist.send(torch.tensor(0), dst=client)
+                        print('Turn sent for client %s' % client)
+                    dist.send(torch.tensor(participating_clients_final), dst=client)
+                print('Client %s passed the dist.new_group' % dist.get_rank())
+                group = dist.new_group(participating_clients_final)
             else:
                 if mini_batches_to_go == 0:
                     while True:
+                        print('============election phase %s started===========' % number_of_elections)
+                        number_of_elections += 1
+                        print('Waiting for the current turn...')
                         dist.recv(turn, src=0)
+                        print('Turn is %s' % turn)
+                        print('Waiting for the winners of the election...')
+                        dist.recv(participating_clients, src=0)
+                        participating_clients_final = participating_clients.tolist()
+                        print('Participating %s' % participating_clients_final)
+                        print('Client %s passed the dist.new_group' % dist.get_rank())
+                        # This needs to be fixed!! Race Condition!! Distributed Systems Bug!
+                        time.sleep(0.03)
+                        group = dist.new_group(participating_clients_final)
                         if turn == 1:
                             mini_batches_to_go = LOCAL_ITERATIONS
                             break
 
             mini_batches_to_go -= 1
             index += 1
-            if index % 250 == 0:
+            if index % 250 == 0 and dist.get_rank() == 0:
                 accuracy(model, test_set)
             optimizer.zero_grad()
             output = model(data)
@@ -90,12 +116,22 @@ def run(rank, size):
             epoch_loss += loss.item()
             current_batch_loss.append(epoch_loss / index)
             loss.backward()
-            if mini_batches_to_go == 0:
-                average_gradients(model)
-            optimizer.step()
             print('Processed', str(index) + '/' + str(train_set_size))
             print('Rank', dist.get_rank(), ', epoch',
                   str(epoch) + ':', epoch_loss / num_batches)
+            if mini_batches_to_go == 0:
+                print('Aggregating...')
+                participating_clients_final = participating_clients.tolist()
+                print('Participating %s' % participating_clients_final)
+            #    average_gradients(model, group=dist.new_group(participating_clients_final))
+                # group = dist.new_group(participating_clients_final)
+                print('Arrived in the average_gradients')
+                print('Rank arrived in averaging: %s' % dist.get_rank())
+                size = dist.get_world_size(group=group)
+                for param in model.parameters():
+                    dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM, group=group)
+                    param.grad.data /= size
+            optimizer.step()
         mini_batch_loss.append(epoch_loss)
         losses.append(epoch_loss)
     print(losses)
@@ -104,10 +140,12 @@ def run(rank, size):
         torch.save(model.state_dict(), './model.pt')
 
 
-def average_gradients(model):
-    size = float(dist.get_world_size())
+def average_gradients(model, group):
+    print('Arrived in the average_gradients')
+    print('Rank arrived in averaging: %s' % dist.get_rank())
+    size = dist.get_world_size(group=group)
     for param in model.parameters():
-        dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+        dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM, group=group)
         param.grad.data /= size
 
 
