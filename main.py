@@ -4,6 +4,8 @@ import torch.distributed as dist
 from torch.multiprocessing import Process
 from torch.functional import F
 from torch import nn
+from torch.utils.tensorboard import SummaryWriter
+
 
 import os
 import sys
@@ -31,7 +33,9 @@ def partition_dataset():
     partition_sizes = [1.0 / size for _ in range(size)]
     partition = CIFAR10(partition_sizes)
     test_set = partition.test
-    fake_set = partition.fake
+    fake_set = torch.utils.data.DataLoader(partition.fake,
+                                           batch_size=BATCH_SIZE,
+                                           shuffle=True)
     partition = partition.use(dist.get_rank())
     train_set = torch.utils.data.DataLoader(partition,
                                          batch_size=BATCH_SIZE,
@@ -67,6 +71,7 @@ def run(rank, size):
     mini_batches_to_go = 0
     number_of_elections = 0
     group = None
+    writer = SummaryWriter('logs/')
     while True:
         if dist.get_rank() == 0 and mini_batches_to_go == 0:
             turn = 1
@@ -115,10 +120,14 @@ def run(rank, size):
             mini_batches_to_go -= 1
             index += 1
             if index % 250 == 0 and dist.get_rank() == 0:
-                accuracy(model, test_set)
+                model_accuracy = accuracy(model, test_set)
+                writer.add_scalar('%s/Validation/Accuracy' % dist.get_rank(), model_accuracy)
+                writer.flush()
             optimizer.zero_grad()
             output = model(data)
             loss = F.cross_entropy(output, target)
+            writer.add_scalar('%s/Train/Loss' % dist.get_rank(), loss.item())
+            writer.flush()
             epoch_loss += loss.item()
             current_batch_loss.append(epoch_loss / index)
             loss.backward()
@@ -170,6 +179,7 @@ def accuracy(model, test_set):
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
     print('====================Accuracy:', 100.0 * correct / total, '=========================================')
+    return 100.0 * correct / total
 
 
 if __name__ == '__main__':
