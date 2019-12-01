@@ -23,6 +23,7 @@ LOCAL_ITERATIONS = 5
 
 criterion = nn.CrossEntropyLoss()
 participating_counts = 2
+fake_targets = [1, 2, 3]
 
 
 def partition_dataset():
@@ -30,16 +31,17 @@ def partition_dataset():
     partition_sizes = [1.0 / size for _ in range(size)]
     partition = CIFAR10(partition_sizes)
     test_set = partition.test
+    fake_set = partition.fake
     partition = partition.use(dist.get_rank())
     train_set = torch.utils.data.DataLoader(partition,
                                          batch_size=BATCH_SIZE,
                                          shuffle=True)
-    return train_set, BATCH_SIZE, test_set
+    return train_set, BATCH_SIZE, test_set, fake_set
 
 
 def run(rank, size):
     torch.manual_seed(1234)
-    train_set, bsz, test_set = partition_dataset()
+    train_set, bsz, test_set, fake_set = partition_dataset()
     print(len(train_set))
     model = ResNet.ResNet18()
     optimizer = optim.SGD(
@@ -55,57 +57,61 @@ def run(rank, size):
 
     losses = []
     mini_batch_loss = []
-    for epoch in range(EPOCHS):
-        epoch_loss = 0.0
-        index = 0
-        current_batch_loss = []
-        turn = torch.tensor(0)
-        participating_clients = torch.zeros(participating_counts + 1, dtype=torch.long)
-        mini_batches_to_go = 0
-        number_of_elections = 0
-        group = None
-        for data, target in train_set:
-            if dist.get_rank() == 0 and mini_batches_to_go == 0:
+    train_set_iterator = iter(train_set)
+    fake_set_iterator = iter(fake_set)
+    epoch_loss = 0.0
+    index = 0
+    current_batch_loss = []
+    turn = torch.tensor(0)
+    participating_clients = torch.zeros(participating_counts + 1, dtype=torch.long)
+    mini_batches_to_go = 0
+    number_of_elections = 0
+    group = None
+    while True:
+        if dist.get_rank() == 0 and mini_batches_to_go == 0:
+            turn = 1
+            print('============election phase %s started===========' % number_of_elections)
+            number_of_elections += 1
+            permutation = torch.randperm(dist.get_world_size() - 1)
+            clients = clients[permutation]
+            participating_clients = clients[0:participating_counts]
+            participating_clients_final = participating_clients.tolist()
+            participating_clients_final.append(0)
+            print('Participating %s' % participating_clients_final)
+            mini_batches_to_go = LOCAL_ITERATIONS
+            for index_2, client in enumerate(clients.tolist()):
+                if index_2 < participating_counts:
+                    dist.send(torch.tensor(1), dst=client)
+                    print('Turn sent for client %s' % client)
+                else:
+                    dist.send(torch.tensor(0), dst=client)
+                    print('Turn sent for client %s' % client)
+                dist.send(torch.tensor(participating_clients_final), dst=client)
+            print('Client %s passed the dist.new_group' % dist.get_rank())
+            group = dist.new_group(participating_clients_final)
+        else:
+            if mini_batches_to_go == 0:
                 print('============election phase %s started===========' % number_of_elections)
                 number_of_elections += 1
-                permutation = torch.randperm(dist.get_world_size() - 1)
-                clients = clients[permutation]
-                participating_clients = clients[0:participating_counts]
-                not_participating = clients[participating_counts:]
+                print('Waiting for the current turn...')
+                dist.recv(turn, src=0)
+                print('Turn is %s' % turn)
+                print('Waiting for the winners of the election...')
+                dist.recv(participating_clients, src=0)
                 participating_clients_final = participating_clients.tolist()
-                participating_clients_final.append(0)
                 print('Participating %s' % participating_clients_final)
-                mini_batches_to_go = LOCAL_ITERATIONS
-                for index_2, client in enumerate(clients.tolist()):
-                    if index_2 < participating_counts:
-                        dist.send(torch.tensor(1), dst=client)
-                        print('Turn sent for client %s' % client)
-                    else:
-                        dist.send(torch.tensor(0), dst=client)
-                        print('Turn sent for client %s' % client)
-                    dist.send(torch.tensor(participating_clients_final), dst=client)
                 print('Client %s passed the dist.new_group' % dist.get_rank())
+                # This needs to be fixed!! Race Condition!! Distributed Systems Bug!
+                time.sleep(0.03)
                 group = dist.new_group(participating_clients_final)
+                if turn == 1:
+                    mini_batches_to_go = LOCAL_ITERATIONS
+        # Only those with the pass can enter the game!
+        if turn == 1:
+            if dist.get_rank() not in fake_targets:
+                data, target = next(train_set_iterator)
             else:
-                if mini_batches_to_go == 0:
-                    while True:
-                        print('============election phase %s started===========' % number_of_elections)
-                        number_of_elections += 1
-                        print('Waiting for the current turn...')
-                        dist.recv(turn, src=0)
-                        print('Turn is %s' % turn)
-                        print('Waiting for the winners of the election...')
-                        dist.recv(participating_clients, src=0)
-                        participating_clients_final = participating_clients.tolist()
-                        print('Participating %s' % participating_clients_final)
-                        print('Client %s passed the dist.new_group' % dist.get_rank())
-                        # This needs to be fixed!! Race Condition!! Distributed Systems Bug!
-                        time.sleep(0.03)
-                        group = dist.new_group(participating_clients_final)
-                        if turn == 1:
-                            mini_batches_to_go = LOCAL_ITERATIONS
-                            break
-
+                data, target = next(fake_set_iterator)
             mini_batches_to_go -= 1
             index += 1
             if index % 250 == 0 and dist.get_rank() == 0:
@@ -117,24 +123,15 @@ def run(rank, size):
             current_batch_loss.append(epoch_loss / index)
             loss.backward()
             print('Processed', str(index) + '/' + str(train_set_size))
-            print('Rank', dist.get_rank(), ', epoch',
-                  str(epoch) + ':', epoch_loss / num_batches)
             if mini_batches_to_go == 0:
                 print('Aggregating...')
                 participating_clients_final = participating_clients.tolist()
                 print('Participating %s' % participating_clients_final)
-            #    average_gradients(model, group=dist.new_group(participating_clients_final))
-                # group = dist.new_group(participating_clients_final)
-                print('Arrived in the average_gradients')
-                print('Rank arrived in averaging: %s' % dist.get_rank())
-                size = dist.get_world_size(group=group)
-                for param in model.parameters():
-                    dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM, group=group)
-                    param.grad.data /= size
+                average_gradients(model, group=group)
             optimizer.step()
-        mini_batch_loss.append(epoch_loss)
-        losses.append(epoch_loss)
-    print(losses)
+    #mini_batch_loss.append(epoch_loss)
+    #losses.append(epoch_loss)
+    #print(losses)
     if dist.get_rank() == 0:
         accuracy(model, test_set)
         torch.save(model.state_dict(), './model.pt')

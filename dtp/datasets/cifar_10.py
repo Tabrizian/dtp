@@ -27,4 +27,12 @@ class CIFAR10(BaseDataset):
         ])
         testset = torchvision.datasets.CIFAR10(root=location, train=False, download=True, transform=transform_test)
         self.test = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=2)
+        self.fake = torchvision.datasets.CIFAR10(
+            root=location,
+            train=True,
+            download=True,
+            transform=self.transformer
+        )
+        self.fake.targets[self.fake.targets == 9] = 8
+
         super().__init__(self.data, sizes)
