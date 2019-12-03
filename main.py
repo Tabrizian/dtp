@@ -21,7 +21,7 @@ EPOCHS = 5
 MASTER_IP = '10.11.13.41'
 MASTER_PORT = '8888'
 BATCH_SIZE = 10
-LOCAL_ITERATIONS = 5
+LOCAL_ITERATIONS = 1
 
 criterion = nn.CrossEntropyLoss()
 participating_counts = 2
@@ -29,14 +29,14 @@ fake_targets = [1, 2, 3]
 
 
 def partition_dataset():
-    size = dist.get_world_size()
+    size = dist.get_world_size() - 1
     partition_sizes = [1.0 / size for _ in range(size)]
     partition = CIFAR10(partition_sizes)
     test_set = partition.test
     fake_set = torch.utils.data.DataLoader(partition.fake,
                                            batch_size=BATCH_SIZE,
                                            shuffle=True)
-    partition = partition.use(dist.get_rank())
+    partition = partition.use(dist.get_rank() - 1)
     train_set = torch.utils.data.DataLoader(partition,
                                          batch_size=BATCH_SIZE,
                                          shuffle=True)
@@ -56,32 +56,32 @@ def run(rank, size):
 
     print('Rank', dist.get_rank())
 
-    num_batches = ceil(len(train_set.dataset) / float(bsz))
-    train_set_size = len(train_set)
+    if dist.get_rank() != 0:
+        num_batches = ceil(len(train_set.dataset) / float(bsz))
+        train_set_size = len(train_set)
+        number_of_epochs = 0
 
-    losses = []
-    mini_batch_loss = []
-    train_set_iterator = iter(train_set)
-    fake_set_iterator = iter(fake_set)
-    epoch_loss = 0.0
-    index = 0
-    current_batch_loss = []
-    turn = torch.tensor(0)
-    participating_clients = torch.zeros(participating_counts + 1, dtype=torch.long)
-    mini_batches_to_go = 0
+        losses = []
+        mini_batch_loss = []
+        train_set_iterator = iter(train_set)
+        fake_set_iterator = iter(fake_set)
+        epoch_loss = 0.0
+        index = 0
+        current_batch_loss = []
+        turn = torch.tensor(0)
+        participating_clients = torch.zeros(participating_counts, dtype=torch.long)
+        mini_batches_to_go = 0
+        group = None
+        writer = SummaryWriter('logs/')
     number_of_elections = 0
-    group = None
-    writer = SummaryWriter('logs/')
     while True:
-        if dist.get_rank() == 0 and mini_batches_to_go == 0:
-            turn = 1
+        if dist.get_rank() == 0:
             print('============election phase %s started===========' % number_of_elections)
             number_of_elections += 1
             permutation = torch.randperm(dist.get_world_size() - 1)
             clients = clients[permutation]
             participating_clients = clients[0:participating_counts]
             participating_clients_final = participating_clients.tolist()
-            participating_clients_final.append(0)
             print('Participating %s' % participating_clients_final)
             mini_batches_to_go = LOCAL_ITERATIONS
             for index_2, client in enumerate(clients.tolist()):
@@ -91,13 +91,23 @@ def run(rank, size):
                 else:
                     dist.send(torch.tensor(0), dst=client)
                     print('Turn sent for client %s' % client)
-                dist.send(torch.tensor(participating_clients_final), dst=client)
+                dist.send(participating_clients, dst=client)
             print('Client %s passed the dist.new_group' % dist.get_rank())
             group = dist.new_group(participating_clients_final)
         else:
             if mini_batches_to_go == 0:
                 print('============election phase %s started===========' % number_of_elections)
                 number_of_elections += 1
+                if number_of_elections == 450 * 5 / LOCAL_ITERATIONS:
+                    number_of_elections = 0
+                    print("////////// Epoch Changed! %s //////////////" % number_of_epochs)
+                    number_of_epochs += 1
+                    if number_of_epochs == EPOCHS:
+                        break
+                    train_set_iterator = iter(train_set)
+                    fake_set_iterator = iter(fake_set)
+                    epoch_loss = 0.0
+
                 print('Waiting for the current turn...')
                 dist.recv(turn, src=0)
                 print('Turn is %s' % turn)
@@ -112,21 +122,21 @@ def run(rank, size):
                 if turn == 1:
                     mini_batches_to_go = LOCAL_ITERATIONS
         # Only those with the pass can enter the game!
-        if turn == 1:
-            if dist.get_rank() not in fake_targets:
-                data, target = next(train_set_iterator)
-            else:
-                data, target = next(fake_set_iterator)
+        if dist.get_rank() != 0 and turn == 1:
+            # if dist.get_rank() not in fake_targets:
+            data, target = next(train_set_iterator)
+            # else:
+            #     data, target = next(fake_set_iterator)
             mini_batches_to_go -= 1
             index += 1
-            if index % 250 == 0 and dist.get_rank() == 0:
+            if index % 250 == 0 and dist.get_rank() == 1:
                 model_accuracy = accuracy(model, test_set)
-                writer.add_scalar('%s/Validation/Accuracy' % dist.get_rank(), model_accuracy)
+                writer.add_scalar('%s/Validation/Accuracy' % dist.get_rank(), model_accuracy, index)
                 writer.flush()
             optimizer.zero_grad()
             output = model(data)
             loss = F.cross_entropy(output, target)
-            writer.add_scalar('%s/Train/Loss' % dist.get_rank(), loss.item())
+            writer.add_scalar('%s/Train/Loss' % dist.get_rank(), loss.item(), index)
             writer.flush()
             epoch_loss += loss.item()
             current_batch_loss.append(epoch_loss / index)
@@ -141,7 +151,7 @@ def run(rank, size):
     #mini_batch_loss.append(epoch_loss)
     #losses.append(epoch_loss)
     #print(losses)
-    if dist.get_rank() == 0:
+    if dist.get_rank() == 1:
         accuracy(model, test_set)
         torch.save(model.state_dict(), './model.pt')
 
@@ -183,23 +193,12 @@ def accuracy(model, test_set):
 
 
 if __name__ == '__main__':
-    # Number of cores available on each machine
-    size = int(sys.argv[3])
-
     # Total number of workers to wait for
     total_size = int(sys.argv[2])
 
     # The current machine worker id
     worker_id = int(sys.argv[1])
 
-    processes = []
-    print('World size is', total_size, 'and the worker id is', worker_id)
-    for rank in range(size):
-        p = Process(target=init_process, args=(rank + size * worker_id, total_size, run))
-        p.start()
-        processes.append(p)
-
-    for p in processes:
-        p.join()
+    init_process(worker_id, total_size, run)
 
 
